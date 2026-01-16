@@ -1,19 +1,105 @@
-use apalis_codec::json::JsonCodec;
 use apalis_core::{
-    backend::{Backend, BackendExt, BoxStream, TaskStream, codec::Codec},
+    backend::{Backend, TaskStream, codec::Codec},
     task::{Task, builder::TaskBuilder, task_id::TaskId},
     worker::context::WorkerContext,
 };
+use futures::StreamExt;
+use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::{
     client::{Client, ClientConfig},
+    subscription::Subscription,
     topic::Topic,
 };
-use pin_project::pin_project;
-use std::marker::PhantomData;
-use utils::PubSubContext;
+use std::{
+    marker::PhantomData,
+    sync::atomic::{AtomicU64, Ordering},
+};
+use tower::Layer;
+use tokio_stream::wrappers::ReceiverStream;
 
-mod sink;
-mod utils;
+pub mod utils;
+use utils::PubSubContext;
+use std::task::{Context, Poll};
+use tower::Service;
+
+/// Middleware layer that acknowledges messages on successful completion
+#[derive(Clone)]
+pub struct AcknowledgeLayer;
+
+impl<S> Layer<S> for AcknowledgeLayer {
+    type Service = AcknowledgeService<S>;
+
+    fn layer(&self, service: S) -> Self::Service {
+        AcknowledgeService { inner: service }
+    }
+}
+
+#[derive(Clone)]
+pub struct AcknowledgeService<S> {
+    inner: S,
+}
+
+impl<S, M> Service<PubSubTask<M>> for AcknowledgeService<S>
+where
+    S: Service<PubSubTask<M>>,
+    S::Future: Send + 'static,
+    S::Response: Send + 'static,
+    S::Error: Send + 'static,
+    M: Send + 'static,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
+    >;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, req: PubSubTask<M>) -> Self::Future {
+        let ctx = req.parts.ctx.clone();
+        let fut = self.inner.call(req);
+
+        Box::pin(async move {
+            let result = fut.await;
+
+            match &result {
+                Ok(_) => {
+                    // Ack on success
+                    if let Err(e) = ctx.ack().await {
+                        tracing::error!(error = ?e, "Failed to acknowledge message");
+                    }
+                }
+                Err(_) => {
+                    // Nack on error to requeue for retry
+                    // Note: If retries are exhausted, the retry layer should handle it
+                    if let Err(e) = ctx.nack().await {
+                        tracing::error!(error = ?e, "Failed to nack message");
+                    }
+                }
+            }
+
+            result
+        })
+    }
+}
+
+/// Error type for PubSub backend operations
+#[derive(Debug, thiserror::Error)]
+pub enum PubSubError {
+    #[error("Pub/Sub client error: {0}")]
+    Client(String),
+
+    #[error("Codec error: {0}")]
+    Codec(Box<dyn std::error::Error + Send + Sync>),
+
+    #[error("Message acknowledgment failed: {0}")]
+    AckFailed(String),
+
+    #[error("Subscription error: {0}")]
+    Subscription(String),
+}
 
 /// Type alias for an PubSub task with context and u64 as the task ID type.
 pub type PubSubTask<T> = Task<T, PubSubContext, u64>;
@@ -21,29 +107,216 @@ pub type PubSubTask<T> = Task<T, PubSubContext, u64>;
 /// Type alias for an PubSub task ID with u64 as the ID type.
 pub type PubSubTaskId = TaskId<u64>;
 
+/// Global task ID counter for generating unique task IDs
+static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+/// Configuration for PubSub backend behavior
 #[derive(Debug, Clone)]
-/// A wrapper around a GCP Pub/Sub `topic` that implements message queuing functionality.
-#[pin_project]
+pub struct PubSubConfig {
+    /// Channel buffer size for message processing (default: 100)
+    pub buffer_size: usize,
+    /// Maximum message size in bytes (default: 10MB)
+    pub max_message_size: usize,
+    /// Maximum number of outstanding messages
+    pub max_outstanding_messages: Option<i64>,
+    /// Maximum bytes of outstanding messages
+    pub max_outstanding_bytes: Option<i64>,
+}
+
+impl Default for PubSubConfig {
+    fn default() -> Self {
+        Self {
+            buffer_size: 100,
+            max_message_size: 10 * 1024 * 1024,
+            max_outstanding_messages: None,
+            max_outstanding_bytes: None,
+        }
+    }
+}
+
+/// A Google Cloud Pub/Sub backend for Apalis job processing.
+///
+/// This backend provides reliable message queue functionality using GCP Pub/Sub,
+/// with support for message acknowledgment, configurable buffering, and graceful shutdown.
+///
+/// # Example
+///
+/// ```no_run
+/// use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// use apalis_codec::json::JsonCodec;
+/// use google_cloud_pubsub::client::ClientConfig;
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Debug, Clone, Serialize, Deserialize)]
+/// struct MyJob {
+///     id: u64,
+///     data: String,
+/// }
+///
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ClientConfig::default().with_auth().await?;
+///
+/// // Create backend with default configuration
+/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+///     PubSubBackend::new_from_config(
+///         config,
+///         "my-topic".to_string(),
+///         "my-subscription".to_string(),
+///     ).await?;
+///
+/// // Publish a job
+/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+///
+/// // Graceful shutdown
+/// backend.shutdown();
+/// # Ok(())
+/// # }
+/// ```
+///
+/// With custom configuration:
+///
+/// ```no_run
+/// # use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// # use apalis_codec::json::JsonCodec;
+/// # use google_cloud_pubsub::client::ClientConfig;
+/// # use serde::{Deserialize, Serialize};
+/// #
+/// # #[derive(Debug, Clone, Serialize, Deserialize)]
+/// # struct MyJob {
+/// #     id: u64,
+/// #     data: String,
+/// # }
+/// #
+/// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+/// let config = ClientConfig::default().with_auth().await?;
+///
+/// let custom_config = PubSubConfig {
+///     buffer_size: 200,
+///     max_message_size: 5 * 1024 * 1024, // 5MB
+///     ..Default::default()
+/// };
+///
+/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+///     PubSubBackend::new_with_config(
+///         config,
+///         "my-topic".to_string(),
+///         "my-subscription".to_string(),
+///         custom_config,
+///     ).await?;
+///
+/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// # Shutdown Behavior
+///
+/// Call `shutdown()` to signal the backend to stop receiving new messages.
+/// In-flight messages will complete processing before the worker terminates.
+#[derive(Debug, Clone)]
 pub struct PubSubBackend<M, Codec> {
+    /// Client must be kept alive as topic/subscription hold references to it
+    #[allow(dead_code)]
     client: Client,
     topic: Topic,
-    message_type: PhantomData<M>,
-    #[pin]
-    sink: sink::PubSubSink<M, Codec>,
+    /// Arc-wrapped subscription for safe sharing across worker threads in poll()
+    subscription: std::sync::Arc<Subscription>,
+    /// Configuration for backend behavior
+    config: PubSubConfig,
+    /// Cancellation token for graceful shutdown
+    cancel: tokio_util::sync::CancellationToken,
+    _phantom: PhantomData<(M, Codec)>,
 }
 
 impl<M, C> PubSubBackend<M, C> {
-    pub async fn new_from_config(config: ClientConfig, topic: String) -> Self {
-        // Create pubsub client.
-        let client = Client::new(config).await.unwrap();
-        // Get the topic to subscribe to.
-        let topic = client.topic(&topic);
-        Self {
+    /// Creates a new PubSubBackend from client configuration with default settings.
+    ///
+    /// # Arguments
+    /// * `config` - The client configuration for Google Cloud Pub/Sub
+    /// * `topic_name` - The name of the topic to publish messages to
+    /// * `subscription_name` - The name of the subscription to receive messages from
+    pub async fn new_from_config(
+        config: ClientConfig,
+        topic_name: String,
+        subscription_name: String,
+    ) -> Result<Self, PubSubError> {
+        Self::new_with_config(config, topic_name, subscription_name, PubSubConfig::default()).await
+    }
+
+    /// Creates a new PubSubBackend with custom configuration.
+    ///
+    /// # Arguments
+    /// * `config` - The client configuration for Google Cloud Pub/Sub
+    /// * `topic_name` - The name of the topic to publish messages to
+    /// * `subscription_name` - The name of the subscription to receive messages from
+    /// * `pubsub_config` - Custom configuration for backend behavior
+    pub async fn new_with_config(
+        config: ClientConfig,
+        topic_name: String,
+        subscription_name: String,
+        pubsub_config: PubSubConfig,
+    ) -> Result<Self, PubSubError> {
+        let client = Client::new(config)
+            .await
+            .map_err(|e| PubSubError::Subscription(e.to_string()))?;
+
+        let topic = client.topic(&topic_name);
+        let subscription = client.subscription(&subscription_name);
+
+        Ok(Self {
             client,
-            topic,
-            message_type: PhantomData,
-            sink: sink::PubSubSink::new(),
-        }
+            topic: topic.clone(),
+            subscription: std::sync::Arc::new(subscription),
+            config: pubsub_config,
+            cancel: tokio_util::sync::CancellationToken::new(),
+            _phantom: PhantomData,
+        })
+    }
+
+    /// Signals the backend to gracefully shutdown.
+    ///
+    /// This will stop receiving new messages from the subscription.
+    /// In-flight messages will complete processing before the worker terminates.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+}
+
+impl<M, C> PubSubBackend<M, C>
+where
+    C: Codec<M, Compact = Vec<u8>>,
+    C::Error: std::error::Error + Send + Sync + 'static,
+{
+    /// Publishes a job to the Pub/Sub topic.
+    ///
+    /// # Arguments
+    /// * `job` - The job to publish
+    ///
+    /// # Returns
+    /// `Ok(())` on successful publish, or `PubSubError` on failure
+    #[tracing::instrument(skip(self, job))]
+    pub async fn push(&self, job: M) -> Result<(), PubSubError> {
+        // Encode the job using the codec
+        let bytes = C::encode(&job).map_err(|e| PubSubError::Codec(Box::new(e)))?;
+
+        // Create a publisher for the topic
+        let publisher = self.topic.new_publisher(None);
+
+        // Create and publish the message
+        let awaiter = publisher
+            .publish(PubsubMessage {
+                data: bytes,
+                ..Default::default()
+            })
+            .await;
+
+        // Await the publish result
+        awaiter
+            .get()
+            .await
+            .map_err(|e| PubSubError::Client(e.to_string()))?;
+
+        Ok(())
     }
 }
 
@@ -53,53 +326,133 @@ where
     C::Error: std::error::Error + Send + Sync + 'static,
 {
     type Args = M;
-    type Error = Error;
-    type Beat = BoxStream<'static, Result<(), Self::Error>>;
-    // type Layer = AcknowledgeLayer<Self>;
+    type Error = PubSubError;
+    type Beat = futures::stream::BoxStream<'static, Result<(), Self::Error>>;
+    type Layer = AcknowledgeLayer;
     type Stream = TaskStream<Task<M, PubSubContext, Self::IdType>, Self::Error>;
     type Context = PubSubContext;
     type IdType = u64;
-    fn heartbeat(&self, worker: &WorkerContext) -> Self::Beat {
-        let _ = worker;
-        unimplemented!()
+
+    fn heartbeat(&self, _worker: &WorkerContext) -> Self::Beat {
+        // Pub/Sub manages connection health internally
+        Box::pin(futures::stream::empty())
     }
 
     fn middleware(&self) -> Self::Layer {
-        unimplemented!()
+        AcknowledgeLayer
     }
 
-    fn poll(self, worker: &WorkerContext) -> Self::Stream {
-        unimplemented!()
+    #[tracing::instrument(skip(self, _worker))]
+    fn poll(self, _worker: &WorkerContext) -> Self::Stream {
+        let subscription = self.subscription.clone();
+        let buffer_size = self.config.buffer_size;
+        let max_message_size = self.config.max_message_size;
+        let cancel = self.cancel.clone();
+        let (tx, rx) = tokio::sync::mpsc::channel(buffer_size);
+
+        // Spawn task to receive messages from Pub/Sub and send to channel
+        let tx_clone = tx.clone();
+        tokio::spawn(async move {
+            let result = subscription
+                .as_ref()
+                .receive(
+                    move |message, _cancel| {
+                        let tx = tx_clone.clone();
+
+                        async move {
+                            let bytes = message.message.data.clone();
+                            let ack_id = message.ack_id().to_string();
+
+                            // Validate message size
+                            if bytes.len() > max_message_size {
+                                tracing::error!(size = bytes.len(), max = max_message_size, "Message exceeds maximum size");
+                                if let Err(e) = message.ack().await {
+                                    tracing::error!(error = ?e, "Failed to ack oversized message");
+                                }
+                                return;
+                            }
+
+                            // Generate unique task ID using atomic counter
+                            let task_id = TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+                            tracing::debug!(task_id, "Received message");
+
+                            // Decode message
+                            let msg: M = match C::decode(&bytes) {
+                                Ok(m) => {
+                                    tracing::trace!("Message decoded successfully");
+                                    m
+                                }
+                                Err(e) => {
+                                    tracing::error!(error = ?e, task_id, "Failed to decode message - treating as poison message");
+                                    // Ack poison messages to prevent infinite redelivery
+                                    if let Err(ack_err) = message.ack().await {
+                                        tracing::error!(error = ?ack_err, "Failed to ack poison message");
+                                    }
+                                    return;
+                                }
+                            };
+
+                            // Create ack/nack closures that own the message
+                            let msg_for_ack = std::sync::Arc::new(tokio::sync::Mutex::new(message));
+                            let msg_for_nack = msg_for_ack.clone();
+
+                            let ack_fn: utils::AckFn = std::sync::Arc::new(move || {
+                                let msg = msg_for_ack.clone();
+                                Box::pin(async move {
+                                    let result = {
+                                        let msg_guard = msg.lock().await;
+                                        msg_guard.ack().await.map_err(|e| e.to_string())
+                                    };
+                                    if result.is_ok() {
+                                        tracing::debug!("Message acknowledged");
+                                    }
+                                    result
+                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+                            });
+
+                            let nack_fn: utils::NackFn = std::sync::Arc::new(move || {
+                                let msg = msg_for_nack.clone();
+                                Box::pin(async move {
+                                    let result = {
+                                        let msg_guard = msg.lock().await;
+                                        msg_guard.nack().await.map_err(|e| e.to_string())
+                                    };
+                                    if result.is_ok() {
+                                        tracing::debug!("Message negatively acknowledged");
+                                    }
+                                    result
+                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
+                            });
+
+                            // Build task with PubSubContext
+                            let task = TaskBuilder::new(msg)
+                                .with_task_id(TaskId::new(task_id))
+                                .with_ctx(PubSubContext::new(ack_id, ack_fn, nack_fn))
+                                .build();
+
+                            // Send task to channel
+                            if let Err(send_err) = tx.send(Ok(Some(task))).await {
+                                tracing::error!(error = ?send_err, "Failed to send task to worker");
+                            }
+                        }
+                    },
+                    cancel.clone(),
+                    None,
+                )
+                .await;
+
+            if let Err(e) = result {
+                tracing::error!(error = ?e, "Subscription error");
+                let err = PubSubError::Subscription(e.to_string());
+                if let Err(send_err) = tx.send(Err(err)).await {
+                    tracing::error!(error = ?send_err, "Failed to send subscription error to worker");
+                }
+            }
+        });
+
+        // Convert channel receiver to stream
+        ReceiverStream::new(rx).boxed()
     }
 }
 
-impl<M, C: Send + 'static> BackendExt for PubSubBackend<M, C>
-where
-    Self: Backend<Args = M, IdType = u64, Context = AmqpContext, Error = lapin::Error>,
-    C: Codec<M, Compact = Vec<u8>> + Send + 'static,
-    C::Error: std::error::Error + Send + Sync + 'static,
-    M: Send + 'static + Unpin,
-{
-    type Codec = C;
-    type Compact = Vec<u8>;
-    type CompactStream = TaskStream<AmqpTask<Self::Compact>, Error>;
-
-    fn get_queue(&self) -> Queue {
-        Queue::from_str(self.queue.name().as_str()).expect("Queue should be a string")
-    }
-
-    fn poll_compact(self, worker: &WorkerContext) -> Self::CompactStream {
-        self.poll_delivery(worker)
-            .map_ok(move |item| {
-                let bytes = item.data;
-                let tag = item.delivery_tag;
-
-                let task = TaskBuilder::new(bytes)
-                    .with_task_id(TaskId::new(tag))
-                    .with_ctx(AmqpContext::new(DeliveryTag::new(tag), item.properties))
-                    .build();
-                Some(task)
-            })
-            .boxed()
-    }
-}
+// BackendExt implementation removed - not needed for PubSub backend
