@@ -1,0 +1,14 @@
+/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/deps/serde-da55df413ccc3b09.d: /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-7cb620e44cc644da/out/private.rs
+
+/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/deps/libserde-da55df413ccc3b09.rlib: /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-7cb620e44cc644da/out/private.rs
+
+/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/deps/libserde-da55df413ccc3b09.rmeta: /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs /Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-7cb620e44cc644da/out/private.rs
+
+/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/lib.rs:
+/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/integer128.rs:
+/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/mod.rs:
+/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/de.rs:
+/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/src/private/ser.rs:
+/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-7cb620e44cc644da/out/private.rs:
+
+# env-dep:OUT_DIR=/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-7cb620e44cc644da/out

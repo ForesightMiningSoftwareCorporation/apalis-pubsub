@@ -1,0 +1,1 @@
+{"rustc":4723136837156968084,"features":"","declared_features":"","target":0,"profile":0,"path":0,"deps":[[7183407847894120427,"build_script_build",false,12985560694259634082]],"local":[{"RerunIfChanged":{"output":"debug/build/zerocopy-4b183be60bb7f960/output","paths":["build.rs","Cargo.toml"]}}],"rustflags":[],"config":0,"compile_kind":0}
