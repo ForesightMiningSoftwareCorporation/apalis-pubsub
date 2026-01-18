@@ -1,6 +1,6 @@
 use apalis_core::{
-    backend::{Backend, TaskStream, codec::Codec},
-    task::{Task, builder::TaskBuilder, task_id::TaskId},
+    backend::{codec::Codec, Backend, TaskStream},
+    task::{builder::TaskBuilder, task_id::TaskId, Task},
     worker::context::WorkerContext,
 };
 use futures::StreamExt;
@@ -14,13 +14,13 @@ use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
-use tower::Layer;
 use tokio_stream::wrappers::ReceiverStream;
+use tower::Layer;
 
 pub mod utils;
-use utils::PubSubContext;
 use std::task::{Context, Poll};
 use tower::Service;
+use utils::PubSubContext;
 
 /// Middleware layer that acknowledges messages on successful completion
 #[derive(Clone)]
@@ -240,7 +240,13 @@ impl<M, C> PubSubBackend<M, C> {
         topic_name: String,
         subscription_name: String,
     ) -> Result<Self, PubSubError> {
-        Self::new_with_config(config, topic_name, subscription_name, PubSubConfig::default()).await
+        Self::new_with_config(
+            config,
+            topic_name,
+            subscription_name,
+            PubSubConfig::default(),
+        )
+        .await
     }
 
     /// Creates a new PubSubBackend with custom configuration.
