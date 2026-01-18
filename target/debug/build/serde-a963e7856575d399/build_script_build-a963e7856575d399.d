@@ -1,5 +1,0 @@
-/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-a963e7856575d399/build_script_build-a963e7856575d399.d: /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/build.rs
-
-/Users/lpostula/projects/fslabs/apalis-pub-sub/target/debug/build/serde-a963e7856575d399/build_script_build-a963e7856575d399: /Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/build.rs
-
-/Users/lpostula/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/serde-1.0.228/build.rs:
