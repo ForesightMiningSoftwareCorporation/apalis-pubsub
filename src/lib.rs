@@ -62,25 +62,11 @@ where
         let fut = self.inner.call(req);
 
         Box::pin(async move {
-            let result = fut.await;
-
-            match &result {
-                Ok(_) => {
-                    // Ack on success
-                    if let Err(e) = ctx.ack().await {
-                        tracing::error!(error = ?e, "Failed to acknowledge message");
-                    }
-                }
-                Err(_) => {
-                    // Nack on error to requeue for retry
-                    // Note: If retries are exhausted, the retry layer should handle it
-                    if let Err(e) = ctx.nack().await {
-                        tracing::error!(error = ?e, "Failed to nack message");
-                    }
-                }
+            // Ack just before starting
+            if let Err(e) = ctx.ack().await {
+                tracing::error!(error = ?e, "Failed to acknowledge message");
             }
-
-            result
+            fut.await
         })
     }
 }
