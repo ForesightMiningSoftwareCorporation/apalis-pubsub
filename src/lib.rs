@@ -10,17 +10,19 @@ use google_cloud_pubsub::{
     subscription::Subscription,
     topic::Topic,
 };
+use std::task::{Context, Poll};
 use std::{
     marker::PhantomData,
     sync::atomic::{AtomicU64, Ordering},
 };
 use tokio_stream::wrappers::ReceiverStream;
 use tower::Layer;
+use tower::Service;
 
 pub mod utils;
-use std::task::{Context, Poll};
-use tower::Service;
 use utils::PubSubContext;
+
+pub use google_cloud_pubsub;
 
 /// Middleware layer that acknowledges messages on successful completion
 #[derive(Clone)]
