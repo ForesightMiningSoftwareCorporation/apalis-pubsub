@@ -336,7 +336,11 @@ where
 
                             // Validate message size
                             if bytes.len() > max_message_size {
-                                tracing::error!(size = bytes.len(), max = max_message_size, "Message exceeds maximum size");
+                                tracing::error!(
+                                    size = bytes.len(),
+                                    max = max_message_size,
+                                    "Message exceeds maximum size"
+                                );
                                 if let Err(e) = message.ack().await {
                                     tracing::error!(error = ?e, "Failed to ack oversized message");
                                 }
@@ -359,7 +363,10 @@ where
                                     );
                                     // Ack poison messages to prevent infinite redelivery
                                     if let Err(ack_err) = message.ack().await {
-                                        tracing::error!(error = ?ack_err, "Failed to ack poison message");
+                                        tracing::error!(
+                                            error = ?ack_err,
+                                            "Failed to ack poison message"
+                                        );
                                     }
                                     return;
                                 }
@@ -386,7 +393,10 @@ where
                                     }
                                 }
                                 Err(send_err) => {
-                                    tracing::error!(error = ?send_err, "Failed to send task to worker");
+                                    tracing::error!(
+                                        error = ?send_err,
+                                        "Failed to send task to worker"
+                                    );
                                 }
                             }
                         }
