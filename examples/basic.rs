@@ -3,8 +3,8 @@ use apalis_codec::json::JsonCodec;
 use apalis_pubsub::{PubSubBackend, PubSubConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::{
-    Arc,
     atomic::{AtomicUsize, Ordering},
+    Arc,
 };
 
 use google_cloud_pubsub::client::ClientConfig;
@@ -14,7 +14,11 @@ struct TestMessage(usize);
 
 async fn test_job(job: TestMessage, count: Data<Arc<AtomicUsize>>) {
     let current = count.fetch_add(1, Ordering::SeqCst);
-    println!("Processing job TestMessage({}), count is now: {}", job.0, current + 1);
+    println!(
+        "Processing job TestMessage({}), count is now: {}",
+        job.0,
+        current + 1
+    );
 }
 
 #[tokio::main]
