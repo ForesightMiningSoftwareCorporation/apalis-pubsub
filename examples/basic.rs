@@ -1,6 +1,6 @@
 use apalis::{layers::retry::RetryPolicy, prelude::*};
 use apalis_codec::json::JsonCodec;
-use apalis_pubsub::{PubSubBackend, PubSubConfig};
+use apalis_pubsub::{PubSubBackend, PubSubCompact, PubSubConfig};
 use serde::{Deserialize, Serialize};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -37,14 +37,15 @@ async fn main() {
         max_outstanding_bytes: Some(100 * 1024 * 1024), // 100MB
     };
 
-    let ps: PubSubBackend<TestMessage, JsonCodec<Vec<u8>>> = PubSubBackend::new_with_config(
-        config,
-        "test-topic1".to_string(),
-        "test-subscription1".to_string(),
-        custom_config,
-    )
-    .await
-    .unwrap();
+    let mut ps: PubSubBackend<TestMessage, JsonCodec<PubSubCompact>> =
+        PubSubBackend::new_with_config(
+            config,
+            "test-topic1".to_string(),
+            "test-subscription1".to_string(),
+            custom_config,
+        )
+        .await
+        .unwrap();
 
     // Push some test jobs to the topic
     ps.push(TestMessage(42)).await.unwrap();
@@ -53,7 +54,7 @@ async fn main() {
 
     // Build and run the worker
     let worker = WorkerBuilder::new("rango-amigo")
-        .backend(ps.clone())
+        .backend(ps)
         .data(Arc::new(AtomicUsize::new(0)))
         .retry(RetryPolicy::retries(5))
         .build(test_job);

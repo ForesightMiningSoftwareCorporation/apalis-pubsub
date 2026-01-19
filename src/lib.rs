@@ -1,10 +1,9 @@
 use apalis_core::{
-    backend::{codec::Codec, Backend, TaskStream},
+    backend::{codec::Codec, queue::Queue, Backend, BackendExt, TaskStream},
     task::{builder::TaskBuilder, task_id::TaskId, Task},
     worker::context::WorkerContext,
 };
 use futures::StreamExt;
-use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::{
     client::{Client, ClientConfig},
     subscription::Subscription,
@@ -19,10 +18,13 @@ use tokio_stream::wrappers::ReceiverStream;
 use tower::Layer;
 use tower::Service;
 
+mod sink;
 pub mod utils;
 use utils::PubSubContext;
 
 pub use google_cloud_pubsub;
+
+use crate::sink::PubSubSink;
 
 /// Middleware layer that acknowledges messages on successful completion
 #[derive(Clone)]
@@ -83,10 +85,15 @@ pub enum PubSubError {
 }
 
 /// Type alias for an PubSub task with context and u64 as the task ID type.
-pub type PubSubTask<T> = Task<T, PubSubContext, u64>;
+pub type PubSubTask<M> = Task<M, PubSubContext, u64>;
 
 /// Type alias for an PubSub task ID with u64 as the ID type.
 pub type PubSubTaskId = TaskId<u64>;
+
+/// The compact storage representation used internally for task data
+///
+/// Task arguments are compressed to this format using the selected [`Codec`]
+pub type PubSubCompact = Vec<u8>;
 
 /// Global task ID counter for generating unique task IDs
 static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -123,7 +130,7 @@ impl Default for PubSubConfig {
 /// # Example
 ///
 /// ```no_run
-/// use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// use apalis_pubsub::{PubSubBackend, PubSubCompact, PubSubConfig};
 /// use apalis_codec::json::JsonCodec;
 /// use google_cloud_pubsub::client::ClientConfig;
 /// use serde::{Deserialize, Serialize};
@@ -138,7 +145,7 @@ impl Default for PubSubConfig {
 /// let config = ClientConfig::default().with_auth().await?;
 ///
 /// // Create backend with default configuration
-/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+/// let backend: PubSubBackend<MyJob, JsonCodec<PubSubCompact> =
 ///     PubSubBackend::new_from_config(
 ///         config,
 ///         "my-topic".to_string(),
@@ -157,7 +164,7 @@ impl Default for PubSubConfig {
 /// With custom configuration:
 ///
 /// ```no_run
-/// # use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// # use apalis_pubsub::{PubSubBackend, PubSubCompact PubSubConfig};
 /// # use apalis_codec::json::JsonCodec;
 /// # use google_cloud_pubsub::client::ClientConfig;
 /// # use serde::{Deserialize, Serialize};
@@ -177,7 +184,7 @@ impl Default for PubSubConfig {
 ///     ..Default::default()
 /// };
 ///
-/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+/// let backend: PubSubBackend<MyJob, JsonCodec<PubSubCompact>> =
 ///     PubSubBackend::new_with_config(
 ///         config,
 ///         "my-topic".to_string(),
@@ -194,7 +201,7 @@ impl Default for PubSubConfig {
 ///
 /// Call `shutdown()` to signal the backend to stop receiving new messages.
 /// In-flight messages will complete processing before the worker terminates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PubSubBackend<M, Codec> {
     /// Client must be kept alive as topic/subscription hold references to it
     #[allow(dead_code)]
@@ -204,6 +211,8 @@ pub struct PubSubBackend<M, Codec> {
     subscription: std::sync::Arc<Subscription>,
     /// Configuration for backend behavior
     config: PubSubConfig,
+    /// [futures::Sink] that consumes tasks and sends them to pub/sub
+    sink: PubSubSink<M, Codec>,
     /// Cancellation token for graceful shutdown
     cancel: tokio_util::sync::CancellationToken,
     _phantom: PhantomData<(M, Codec)>,
@@ -255,6 +264,7 @@ impl<M, C> PubSubBackend<M, C> {
             topic: topic.clone(),
             subscription: std::sync::Arc::new(subscription),
             config: pubsub_config,
+            sink: PubSubSink::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             _phantom: PhantomData,
         })
@@ -269,47 +279,9 @@ impl<M, C> PubSubBackend<M, C> {
     }
 }
 
-impl<M, C> PubSubBackend<M, C>
-where
-    C: Codec<M, Compact = Vec<u8>>,
-    C::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Publishes a job to the Pub/Sub topic.
-    ///
-    /// # Arguments
-    /// * `job` - The job to publish
-    ///
-    /// # Returns
-    /// `Ok(())` on successful publish, or `PubSubError` on failure
-    #[tracing::instrument(skip(self, job))]
-    pub async fn push(&self, job: M) -> Result<(), PubSubError> {
-        // Encode the job using the codec
-        let bytes = C::encode(&job).map_err(|e| PubSubError::Codec(Box::new(e)))?;
-
-        // Create a publisher for the topic
-        let publisher = self.topic.new_publisher(None);
-
-        // Create and publish the message
-        let awaiter = publisher
-            .publish(PubsubMessage {
-                data: bytes,
-                ..Default::default()
-            })
-            .await;
-
-        // Await the publish result
-        awaiter
-            .get()
-            .await
-            .map_err(|e| PubSubError::Client(e.to_string()))?;
-
-        Ok(())
-    }
-}
-
 impl<M: Send + 'static, C> Backend for PubSubBackend<M, C>
 where
-    C: Codec<M, Compact = Vec<u8>>,
+    C: Codec<M, Compact = PubSubCompact>,
     C::Error: std::error::Error + Send + Sync + 'static,
 {
     type Args = M;
@@ -420,4 +392,25 @@ where
     }
 }
 
-// BackendExt implementation removed - not needed for PubSub backend
+impl<M, Decode> BackendExt for PubSubBackend<M, Decode>
+where
+    M: Send + 'static,
+    Decode: Codec<M, Compact = PubSubCompact>,
+    Decode::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Codec = Decode;
+
+    type Compact = PubSubCompact;
+
+    type CompactStream = TaskStream<PubSubTask<PubSubCompact>, Self::Error>;
+
+    fn get_queue(&self) -> Queue {
+        self.topic.id().into()
+    }
+
+    fn poll_compact(self, _worker: &WorkerContext) -> Self::CompactStream {
+        // We don't give compacted messages to workers
+        // Just return an empty stream
+        futures::stream::empty().boxed()
+    }
+}
