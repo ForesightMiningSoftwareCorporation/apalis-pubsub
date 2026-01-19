@@ -60,16 +60,9 @@ where
     }
 
     fn call(&mut self, req: PubSubTask<M>) -> Self::Future {
-        let ctx = req.parts.ctx.clone();
         let fut = self.inner.call(req);
 
-        Box::pin(async move {
-            // Ack just before starting
-            if let Err(e) = ctx.ack().await {
-                tracing::error!(error = ?e, "Failed to acknowledge message");
-            }
-            fut.await
-        })
+        Box::pin(fut)
     }
 }
 
@@ -386,47 +379,25 @@ where
                                 }
                             };
 
-                            // Create ack/nack closures that own the message
-                            let msg_for_ack = std::sync::Arc::new(tokio::sync::Mutex::new(message));
-                            let msg_for_nack = msg_for_ack.clone();
-
-                            let ack_fn: utils::AckFn = std::sync::Arc::new(move || {
-                                let msg = msg_for_ack.clone();
-                                Box::pin(async move {
-                                    let result = {
-                                        let msg_guard = msg.lock().await;
-                                        msg_guard.ack().await.map_err(|e| e.to_string())
-                                    };
-                                    if result.is_ok() {
-                                        tracing::debug!("Message acknowledged");
-                                    }
-                                    result
-                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-                            });
-
-                            let nack_fn: utils::NackFn = std::sync::Arc::new(move || {
-                                let msg = msg_for_nack.clone();
-                                Box::pin(async move {
-                                    let result = {
-                                        let msg_guard = msg.lock().await;
-                                        msg_guard.nack().await.map_err(|e| e.to_string())
-                                    };
-                                    if result.is_ok() {
-                                        tracing::debug!("Message negatively acknowledged");
-                                    }
-                                    result
-                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-                            });
-
                             // Build task with PubSubContext
                             let task = TaskBuilder::new(msg)
                                 .with_task_id(TaskId::new(task_id))
-                                .with_ctx(PubSubContext::new(ack_id, ack_fn, nack_fn))
+                                .with_ctx(PubSubContext::new(ack_id))
                                 .build();
 
                             // Send task to channel
-                            if let Err(send_err) = tx.send(Ok(Some(task))).await {
-                                tracing::error!(error = ?send_err, "Failed to send task to worker");
+                            match tx.send(Ok(Some(task))).await {
+                                Ok(()) => {
+                                    // Ack message now that we've committed to processing it
+                                    if let Err(ack_err) = message.ack().await {
+                                        tracing::error!(error = ?ack_err, "Failed to ack message");
+                                    } else {
+                                        tracing::debug!("Message acknowledged");
+                                    }
+                                }
+                                Err(send_err) => {
+                                    tracing::error!(error = ?send_err, "Failed to send task to worker");
+                                }
                             }
                         }
                     },
