@@ -26,22 +26,22 @@ pub use google_cloud_pubsub;
 
 /// Middleware layer that acknowledges messages on successful completion
 #[derive(Clone)]
-pub struct AcknowledgeLayer;
+pub struct PubSubLayer;
 
-impl<S> Layer<S> for AcknowledgeLayer {
-    type Service = AcknowledgeService<S>;
+impl<S> Layer<S> for PubSubLayer {
+    type Service = PubSubService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        AcknowledgeService { inner: service }
+        PubSubService { inner: service }
     }
 }
 
 #[derive(Clone)]
-pub struct AcknowledgeService<S> {
+pub struct PubSubService<S> {
     inner: S,
 }
 
-impl<S, M> Service<PubSubTask<M>> for AcknowledgeService<S>
+impl<S, M> Service<PubSubTask<M>> for PubSubService<S>
 where
     S: Service<PubSubTask<M>>,
     S::Future: Send + 'static,
@@ -60,9 +60,9 @@ where
     }
 
     fn call(&mut self, req: PubSubTask<M>) -> Self::Future {
-        let fut = self.inner.call(req);
-
-        Box::pin(fut)
+        // We don't need to do anything special in our tower service,
+        // so just pass execution down the tree
+        Box::pin(self.inner.call(req))
     }
 }
 
@@ -315,7 +315,7 @@ where
     type Args = M;
     type Error = PubSubError;
     type Beat = futures::stream::BoxStream<'static, Result<(), Self::Error>>;
-    type Layer = AcknowledgeLayer;
+    type Layer = PubSubLayer;
     type Stream = TaskStream<Task<M, PubSubContext, Self::IdType>, Self::Error>;
     type Context = PubSubContext;
     type IdType = u64;
@@ -326,7 +326,7 @@ where
     }
 
     fn middleware(&self) -> Self::Layer {
-        AcknowledgeLayer
+        PubSubLayer
     }
 
     #[tracing::instrument(skip(self, _worker))]
