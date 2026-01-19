@@ -10,7 +10,7 @@ use futures::{
 };
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 
-use crate::{PubSubBackend, PubSubCompact, PubSubError, PubSubTask};
+use crate::{PubSubBackend, PubSubCompact, PubSubError, PubSubTask, PUBSUB_ATTRIBUTE_TASK_ID};
 
 /// The type of the future that the sink polls when attempting to flush data
 type SinkFlushFuture = BoxFuture<'static, Result<(), PubSubError>>;
@@ -82,19 +82,41 @@ where
                     // Send each task off to the backend
                     let publisher = publisher.clone();
                     async move {
-                        // Note: this publish function is also buffered, so this whole chain is actually double-buffered
-                        let awaiter = publisher
-                            .publish(PubsubMessage {
-                                data: task.args,
-                                ..Default::default()
+                        let mut message = PubsubMessage {
+                            data: task.args,
+                            ..Default::default()
+                        };
+
+                        let task_id_log = task
+                            .parts
+                            .task_id
+                            .map(|id| {
+                                let id = id.to_string();
+
+                                // Make log message
+                                let log_msg = format!("\n\tTask ID: {}", &id);
+
+                                // Put task in message attributes
+                                message
+                                    .attributes
+                                    .insert(PUBSUB_ATTRIBUTE_TASK_ID.to_owned(), id);
+
+                                log_msg
                             })
-                            .await;
+                            .unwrap_or_default();
+
+                        // Note: this publish function is also buffered, so this whole chain is actually double-buffered
+                        let awaiter = publisher.publish(message).await;
 
                         // Await the publish result
                         awaiter
                             .get()
                             .await
-                            .inspect(|id| tracing::debug!("Message published:\n\tPub/sub id: {id}"))
+                            .inspect(|id| {
+                                tracing::debug!(
+                                    "Message published:\n\tPub/sub id: {id}{task_id_log}"
+                                )
+                            })
                             .map_err(|e| PubSubError::Client(e.to_string()))
                     }
                 });

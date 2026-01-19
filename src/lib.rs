@@ -9,11 +9,8 @@ use google_cloud_pubsub::{
     subscription::Subscription,
     topic::Topic,
 };
+use std::marker::PhantomData;
 use std::task::{Context, Poll};
-use std::{
-    marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
-};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::Layer;
 use tower::Service;
@@ -95,8 +92,11 @@ pub type PubSubTaskId = TaskId<u64>;
 /// Task arguments are compressed to this format using the selected [`Codec`]
 pub type PubSubCompact = Vec<u8>;
 
-/// Global task ID counter for generating unique task IDs
-static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// Name of the task id attribute in pub/sub
+///
+/// pub/sub attributes just map string keys to string values,
+/// so we make a constant for the key.
+pub(crate) const PUBSUB_ATTRIBUTE_TASK_ID: &'static str = "task_id";
 
 /// Configuration for PubSub backend behavior
 #[derive(Debug, Clone)]
@@ -321,6 +321,18 @@ where
                         async move {
                             let bytes = message.message.data.clone();
                             let ack_id = message.ack_id().to_string();
+                            let task_id = message
+                                .message
+                                .attributes
+                                .get(PUBSUB_ATTRIBUTE_TASK_ID)
+                                .map(|s| {
+                                    s.parse::<u64>()
+                                        .inspect_err(|e| {
+                                            tracing::error!("Failed to deserialize task id: {e}")
+                                        })
+                                        .ok()
+                                })
+                                .flatten();
 
                             // Validate message size
                             if bytes.len() > max_message_size {
@@ -331,8 +343,6 @@ where
                                 return;
                             }
 
-                            // Generate unique task ID using atomic counter
-                            let task_id = TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!(task_id, "Received message");
 
                             // Decode message
@@ -352,10 +362,14 @@ where
                             };
 
                             // Build task with PubSubContext
-                            let task = TaskBuilder::new(msg)
-                                .with_task_id(TaskId::new(task_id))
-                                .with_ctx(PubSubContext::new(ack_id))
-                                .build();
+                            let mut task =
+                                TaskBuilder::new(msg).with_ctx(PubSubContext::new(ack_id));
+
+                            if let Some(task_id) = task_id {
+                                task = task.with_task_id(TaskId::new(task_id))
+                            }
+
+                            let task = task.build();
 
                             // Send task to channel
                             match tx.send(Ok(Some(task))).await {
