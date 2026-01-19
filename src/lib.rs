@@ -9,11 +9,12 @@ use google_cloud_pubsub::{
     subscription::Subscription,
     topic::Topic,
 };
-use std::marker::PhantomData;
 use std::task::{Context, Poll};
+use std::{marker::PhantomData, str::FromStr};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::Layer;
 use tower::Service;
+use uuid::Uuid;
 
 mod sink;
 pub mod utils;
@@ -81,11 +82,11 @@ pub enum PubSubError {
     Subscription(String),
 }
 
-/// Type alias for an PubSub task with context and u64 as the task ID type.
-pub type PubSubTask<M> = Task<M, PubSubContext, u64>;
+/// Type alias for an PubSub task with context and [`PubSubTaskId`] as the task ID type.
+pub type PubSubTask<M> = Task<M, PubSubContext, PubSubTaskId>;
 
-/// Type alias for an PubSub task ID with u64 as the ID type.
-pub type PubSubTaskId = TaskId<u64>;
+/// Type alias for the it type used by [`PubSubTask`]s
+pub type PubSubTaskId = Uuid;
 
 /// The compact storage representation used internally for task data
 ///
@@ -137,7 +138,6 @@ impl Default for PubSubConfig {
 ///
 /// #[derive(Debug, Clone, Serialize, Deserialize)]
 /// struct MyJob {
-///     id: u64,
 ///     data: String,
 /// }
 ///
@@ -153,7 +153,7 @@ impl Default for PubSubConfig {
 ///     ).await?;
 ///
 /// // Publish a job
-/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+/// backend.push(MyJob { data: "test".into() }).await?;
 ///
 /// // Graceful shutdown
 /// backend.shutdown();
@@ -171,7 +171,6 @@ impl Default for PubSubConfig {
 /// #
 /// # #[derive(Debug, Clone, Serialize, Deserialize)]
 /// # struct MyJob {
-/// #     id: u64,
 /// #     data: String,
 /// # }
 /// #
@@ -192,7 +191,7 @@ impl Default for PubSubConfig {
 ///         custom_config,
 ///     ).await?;
 ///
-/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+/// backend.push(MyJob { id: data: "test".into() }).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -290,7 +289,7 @@ where
     type Layer = PubSubLayer;
     type Stream = TaskStream<Task<M, PubSubContext, Self::IdType>, Self::Error>;
     type Context = PubSubContext;
-    type IdType = u64;
+    type IdType = PubSubTaskId;
 
     fn heartbeat(&self, _worker: &WorkerContext) -> Self::Beat {
         // Pub/Sub manages connection health internally
@@ -326,13 +325,14 @@ where
                                 .attributes
                                 .get(PUBSUB_ATTRIBUTE_TASK_ID)
                                 .map(|s| {
-                                    s.parse::<u64>()
+                                    Uuid::from_str(s)
                                         .inspect_err(|e| {
                                             tracing::error!("Failed to deserialize task id: {e}")
                                         })
                                         .ok()
                                 })
                                 .flatten();
+                            let task_id_str = task_id.map(|id| id.to_string());
 
                             // Validate message size
                             if bytes.len() > max_message_size {
@@ -343,7 +343,7 @@ where
                                 return;
                             }
 
-                            tracing::debug!(task_id, "Received message");
+                            tracing::debug!(task_id_str, "Received message");
 
                             // Decode message
                             let msg: M = match C::decode(&bytes) {
@@ -352,7 +352,11 @@ where
                                     m
                                 }
                                 Err(e) => {
-                                    tracing::error!(error = ?e, task_id, "Failed to decode message - treating as poison message");
+                                    tracing::error!(
+                                        error = ?e,
+                                        task_id_str,
+                                        "Failed to decode message - treating as poison message"
+                                    );
                                     // Ack poison messages to prevent infinite redelivery
                                     if let Err(ack_err) = message.ack().await {
                                         tracing::error!(error = ?ack_err, "Failed to ack poison message");

@@ -17,6 +17,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 google-cloud-googleapis = "0.16.1"
 tracing = "0.1"
+uuid = "1.19.0"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 apalis-core = { version = "1.0.0-rc.2" }
