@@ -1,47 +1,47 @@
 use apalis_core::{
-    backend::{codec::Codec, Backend, TaskStream},
+    backend::{codec::Codec, queue::Queue, Backend, BackendExt, TaskStream},
     task::{builder::TaskBuilder, task_id::TaskId, Task},
     worker::context::WorkerContext,
 };
 use futures::StreamExt;
-use google_cloud_googleapis::pubsub::v1::PubsubMessage;
 use google_cloud_pubsub::{
     client::{Client, ClientConfig},
     subscription::Subscription,
     topic::Topic,
 };
 use std::task::{Context, Poll};
-use std::{
-    marker::PhantomData,
-    sync::atomic::{AtomicU64, Ordering},
-};
+use std::{marker::PhantomData, str::FromStr};
 use tokio_stream::wrappers::ReceiverStream;
 use tower::Layer;
 use tower::Service;
+use uuid::Uuid;
 
+mod sink;
 pub mod utils;
 use utils::PubSubContext;
 
 pub use google_cloud_pubsub;
 
+use crate::sink::PubSubSink;
+
 /// Middleware layer that acknowledges messages on successful completion
 #[derive(Clone)]
-pub struct AcknowledgeLayer;
+pub struct PubSubLayer;
 
-impl<S> Layer<S> for AcknowledgeLayer {
-    type Service = AcknowledgeService<S>;
+impl<S> Layer<S> for PubSubLayer {
+    type Service = PubSubService<S>;
 
     fn layer(&self, service: S) -> Self::Service {
-        AcknowledgeService { inner: service }
+        PubSubService { inner: service }
     }
 }
 
 #[derive(Clone)]
-pub struct AcknowledgeService<S> {
+pub struct PubSubService<S> {
     inner: S,
 }
 
-impl<S, M> Service<PubSubTask<M>> for AcknowledgeService<S>
+impl<S, M> Service<PubSubTask<M>> for PubSubService<S>
 where
     S: Service<PubSubTask<M>>,
     S::Future: Send + 'static,
@@ -60,27 +60,17 @@ where
     }
 
     fn call(&mut self, req: PubSubTask<M>) -> Self::Future {
-        let ctx = req.parts.ctx.clone();
-        let fut = self.inner.call(req);
-
-        Box::pin(async move {
-            // Ack just before starting
-            if let Err(e) = ctx.ack().await {
-                tracing::error!(error = ?e, "Failed to acknowledge message");
-            }
-            fut.await
-        })
+        // We don't need to do anything special in our tower service,
+        // so just pass execution down the tree
+        Box::pin(self.inner.call(req))
     }
 }
 
 /// Error type for PubSub backend operations
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PubSubError {
     #[error("Pub/Sub client error: {0}")]
     Client(String),
-
-    #[error("Codec error: {0}")]
-    Codec(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Message acknowledgment failed: {0}")]
     AckFailed(String),
@@ -89,14 +79,22 @@ pub enum PubSubError {
     Subscription(String),
 }
 
-/// Type alias for an PubSub task with context and u64 as the task ID type.
-pub type PubSubTask<T> = Task<T, PubSubContext, u64>;
+/// Type alias for an PubSub task with context and [`PubSubTaskId`] as the task ID type.
+pub type PubSubTask<M> = Task<M, PubSubContext, PubSubTaskId>;
 
-/// Type alias for an PubSub task ID with u64 as the ID type.
-pub type PubSubTaskId = TaskId<u64>;
+/// Type alias for the it type used by [`PubSubTask`]s
+pub type PubSubTaskId = Uuid;
 
-/// Global task ID counter for generating unique task IDs
-static TASK_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+/// The compact storage representation used internally for task data
+///
+/// Task arguments are compressed to this format using the selected [`Codec`]
+pub type PubSubCompact = Vec<u8>;
+
+/// Name of the task id attribute in pub/sub
+///
+/// pub/sub attributes just map string keys to string values,
+/// so we make a constant for the key.
+pub(crate) const PUBSUB_ATTRIBUTE_TASK_ID: &'static str = "task_id";
 
 /// Configuration for PubSub backend behavior
 #[derive(Debug, Clone)]
@@ -130,14 +128,13 @@ impl Default for PubSubConfig {
 /// # Example
 ///
 /// ```no_run
-/// use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// use apalis_pubsub::{PubSubBackend, PubSubCompact, PubSubConfig};
 /// use apalis_codec::json::JsonCodec;
 /// use google_cloud_pubsub::client::ClientConfig;
 /// use serde::{Deserialize, Serialize};
 ///
 /// #[derive(Debug, Clone, Serialize, Deserialize)]
 /// struct MyJob {
-///     id: u64,
 ///     data: String,
 /// }
 ///
@@ -145,7 +142,7 @@ impl Default for PubSubConfig {
 /// let config = ClientConfig::default().with_auth().await?;
 ///
 /// // Create backend with default configuration
-/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+/// let backend: PubSubBackend<MyJob, JsonCodec<PubSubCompact> =
 ///     PubSubBackend::new_from_config(
 ///         config,
 ///         "my-topic".to_string(),
@@ -153,7 +150,7 @@ impl Default for PubSubConfig {
 ///     ).await?;
 ///
 /// // Publish a job
-/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+/// backend.push(MyJob { data: "test".into() }).await?;
 ///
 /// // Graceful shutdown
 /// backend.shutdown();
@@ -164,14 +161,13 @@ impl Default for PubSubConfig {
 /// With custom configuration:
 ///
 /// ```no_run
-/// # use apalis_pubsub::{PubSubBackend, PubSubConfig};
+/// # use apalis_pubsub::{PubSubBackend, PubSubCompact PubSubConfig};
 /// # use apalis_codec::json::JsonCodec;
 /// # use google_cloud_pubsub::client::ClientConfig;
 /// # use serde::{Deserialize, Serialize};
 /// #
 /// # #[derive(Debug, Clone, Serialize, Deserialize)]
 /// # struct MyJob {
-/// #     id: u64,
 /// #     data: String,
 /// # }
 /// #
@@ -184,7 +180,7 @@ impl Default for PubSubConfig {
 ///     ..Default::default()
 /// };
 ///
-/// let backend: PubSubBackend<MyJob, JsonCodec<Vec<u8>>> =
+/// let backend: PubSubBackend<MyJob, JsonCodec<PubSubCompact>> =
 ///     PubSubBackend::new_with_config(
 ///         config,
 ///         "my-topic".to_string(),
@@ -192,7 +188,7 @@ impl Default for PubSubConfig {
 ///         custom_config,
 ///     ).await?;
 ///
-/// backend.push(MyJob { id: 1, data: "test".into() }).await?;
+/// backend.push(MyJob { id: data: "test".into() }).await?;
 /// # Ok(())
 /// # }
 /// ```
@@ -201,7 +197,7 @@ impl Default for PubSubConfig {
 ///
 /// Call `shutdown()` to signal the backend to stop receiving new messages.
 /// In-flight messages will complete processing before the worker terminates.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct PubSubBackend<M, Codec> {
     /// Client must be kept alive as topic/subscription hold references to it
     #[allow(dead_code)]
@@ -211,6 +207,8 @@ pub struct PubSubBackend<M, Codec> {
     subscription: std::sync::Arc<Subscription>,
     /// Configuration for backend behavior
     config: PubSubConfig,
+    /// [futures::Sink] that consumes tasks and sends them to pub/sub
+    sink: PubSubSink<M, Codec>,
     /// Cancellation token for graceful shutdown
     cancel: tokio_util::sync::CancellationToken,
     _phantom: PhantomData<(M, Codec)>,
@@ -262,6 +260,7 @@ impl<M, C> PubSubBackend<M, C> {
             topic: topic.clone(),
             subscription: std::sync::Arc::new(subscription),
             config: pubsub_config,
+            sink: PubSubSink::new(),
             cancel: tokio_util::sync::CancellationToken::new(),
             _phantom: PhantomData,
         })
@@ -276,56 +275,18 @@ impl<M, C> PubSubBackend<M, C> {
     }
 }
 
-impl<M, C> PubSubBackend<M, C>
-where
-    C: Codec<M, Compact = Vec<u8>>,
-    C::Error: std::error::Error + Send + Sync + 'static,
-{
-    /// Publishes a job to the Pub/Sub topic.
-    ///
-    /// # Arguments
-    /// * `job` - The job to publish
-    ///
-    /// # Returns
-    /// `Ok(())` on successful publish, or `PubSubError` on failure
-    #[tracing::instrument(skip(self, job))]
-    pub async fn push(&self, job: M) -> Result<(), PubSubError> {
-        // Encode the job using the codec
-        let bytes = C::encode(&job).map_err(|e| PubSubError::Codec(Box::new(e)))?;
-
-        // Create a publisher for the topic
-        let publisher = self.topic.new_publisher(None);
-
-        // Create and publish the message
-        let awaiter = publisher
-            .publish(PubsubMessage {
-                data: bytes,
-                ..Default::default()
-            })
-            .await;
-
-        // Await the publish result
-        awaiter
-            .get()
-            .await
-            .map_err(|e| PubSubError::Client(e.to_string()))?;
-
-        Ok(())
-    }
-}
-
 impl<M: Send + 'static, C> Backend for PubSubBackend<M, C>
 where
-    C: Codec<M, Compact = Vec<u8>>,
+    C: Codec<M, Compact = PubSubCompact>,
     C::Error: std::error::Error + Send + Sync + 'static,
 {
     type Args = M;
     type Error = PubSubError;
     type Beat = futures::stream::BoxStream<'static, Result<(), Self::Error>>;
-    type Layer = AcknowledgeLayer;
+    type Layer = PubSubLayer;
     type Stream = TaskStream<Task<M, PubSubContext, Self::IdType>, Self::Error>;
     type Context = PubSubContext;
-    type IdType = u64;
+    type IdType = PubSubTaskId;
 
     fn heartbeat(&self, _worker: &WorkerContext) -> Self::Beat {
         // Pub/Sub manages connection health internally
@@ -333,7 +294,7 @@ where
     }
 
     fn middleware(&self) -> Self::Layer {
-        AcknowledgeLayer
+        PubSubLayer
     }
 
     #[tracing::instrument(skip(self, _worker))]
@@ -356,19 +317,34 @@ where
                         async move {
                             let bytes = message.message.data.clone();
                             let ack_id = message.ack_id().to_string();
+                            let task_id = message
+                                .message
+                                .attributes
+                                .get(PUBSUB_ATTRIBUTE_TASK_ID)
+                                .map(|s| {
+                                    Uuid::from_str(s)
+                                        .inspect_err(|e| {
+                                            tracing::error!("Failed to deserialize task id: {e}")
+                                        })
+                                        .ok()
+                                })
+                                .flatten();
+                            let task_id_str = task_id.map(|id| id.to_string());
 
                             // Validate message size
                             if bytes.len() > max_message_size {
-                                tracing::error!(size = bytes.len(), max = max_message_size, "Message exceeds maximum size");
+                                tracing::error!(
+                                    size = bytes.len(),
+                                    max = max_message_size,
+                                    "Message exceeds maximum size"
+                                );
                                 if let Err(e) = message.ack().await {
                                     tracing::error!(error = ?e, "Failed to ack oversized message");
                                 }
                                 return;
                             }
 
-                            // Generate unique task ID using atomic counter
-                            let task_id = TASK_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
-                            tracing::debug!(task_id, "Received message");
+                            tracing::debug!(task_id_str, "Received message");
 
                             // Decode message
                             let msg: M = match C::decode(&bytes) {
@@ -377,56 +353,48 @@ where
                                     m
                                 }
                                 Err(e) => {
-                                    tracing::error!(error = ?e, task_id, "Failed to decode message - treating as poison message");
+                                    tracing::error!(
+                                        error = ?e,
+                                        task_id_str,
+                                        "Failed to decode message - treating as poison message"
+                                    );
                                     // Ack poison messages to prevent infinite redelivery
                                     if let Err(ack_err) = message.ack().await {
-                                        tracing::error!(error = ?ack_err, "Failed to ack poison message");
+                                        tracing::error!(
+                                            error = ?ack_err,
+                                            "Failed to ack poison message"
+                                        );
                                     }
                                     return;
                                 }
                             };
 
-                            // Create ack/nack closures that own the message
-                            let msg_for_ack = std::sync::Arc::new(tokio::sync::Mutex::new(message));
-                            let msg_for_nack = msg_for_ack.clone();
-
-                            let ack_fn: utils::AckFn = std::sync::Arc::new(move || {
-                                let msg = msg_for_ack.clone();
-                                Box::pin(async move {
-                                    let result = {
-                                        let msg_guard = msg.lock().await;
-                                        msg_guard.ack().await.map_err(|e| e.to_string())
-                                    };
-                                    if result.is_ok() {
-                                        tracing::debug!("Message acknowledged");
-                                    }
-                                    result
-                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-                            });
-
-                            let nack_fn: utils::NackFn = std::sync::Arc::new(move || {
-                                let msg = msg_for_nack.clone();
-                                Box::pin(async move {
-                                    let result = {
-                                        let msg_guard = msg.lock().await;
-                                        msg_guard.nack().await.map_err(|e| e.to_string())
-                                    };
-                                    if result.is_ok() {
-                                        tracing::debug!("Message negatively acknowledged");
-                                    }
-                                    result
-                                }) as std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send>>
-                            });
-
                             // Build task with PubSubContext
-                            let task = TaskBuilder::new(msg)
-                                .with_task_id(TaskId::new(task_id))
-                                .with_ctx(PubSubContext::new(ack_id, ack_fn, nack_fn))
-                                .build();
+                            let mut task =
+                                TaskBuilder::new(msg).with_ctx(PubSubContext::new(ack_id));
+
+                            if let Some(task_id) = task_id {
+                                task = task.with_task_id(TaskId::new(task_id))
+                            }
+
+                            let task = task.build();
 
                             // Send task to channel
-                            if let Err(send_err) = tx.send(Ok(Some(task))).await {
-                                tracing::error!(error = ?send_err, "Failed to send task to worker");
+                            match tx.send(Ok(Some(task))).await {
+                                Ok(()) => {
+                                    // Ack message now that we've committed to processing it
+                                    if let Err(ack_err) = message.ack().await {
+                                        tracing::error!(error = ?ack_err, "Failed to ack message");
+                                    } else {
+                                        tracing::debug!("Message acknowledged");
+                                    }
+                                }
+                                Err(send_err) => {
+                                    tracing::error!(
+                                        error = ?send_err,
+                                        "Failed to send task to worker"
+                                    );
+                                }
                             }
                         }
                     },
@@ -449,4 +417,25 @@ where
     }
 }
 
-// BackendExt implementation removed - not needed for PubSub backend
+impl<M, Decode> BackendExt for PubSubBackend<M, Decode>
+where
+    M: Send + 'static,
+    Decode: Codec<M, Compact = PubSubCompact>,
+    Decode::Error: std::error::Error + Send + Sync + 'static,
+{
+    type Codec = Decode;
+
+    type Compact = PubSubCompact;
+
+    type CompactStream = TaskStream<PubSubTask<PubSubCompact>, Self::Error>;
+
+    fn get_queue(&self) -> Queue {
+        self.topic.id().into()
+    }
+
+    fn poll_compact(self, _worker: &WorkerContext) -> Self::CompactStream {
+        // We don't give compacted messages to workers
+        // Just return an empty stream
+        futures::stream::empty().boxed()
+    }
+}
