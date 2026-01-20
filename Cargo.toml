@@ -6,7 +6,10 @@ edition = "2021"
 [dependencies]
 apalis-core = { version = "1.0.0-rc.2", features = ["sleep"] }
 apalis-codec = { version = "0.1.0-rc.2", features = ["json"] }
-google-cloud-pubsub = { version = "0.30.0", default-features = false, features = ["auth", "rustls-tls"] }
+google-cloud-pubsub = { version = "0.30.0", default-features = false, features = [
+    "auth",
+    "rustls-tls",
+] }
 pin-project = "1.1.10"
 serde = { version = "1", features = ["derive"] }
 futures = "0.3.31"
@@ -17,7 +20,7 @@ tokio-stream = "0.1"
 tokio-util = "0.7"
 google-cloud-googleapis = "0.16.1"
 tracing = "0.1"
-uuid = "1.19.0"
+uuid = "1.12.0"
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }
 apalis-core = { version = "1.0.0-rc.2" }

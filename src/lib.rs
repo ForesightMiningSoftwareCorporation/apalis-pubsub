@@ -67,13 +67,10 @@ where
 }
 
 /// Error type for PubSub backend operations
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum PubSubError {
     #[error("Pub/Sub client error: {0}")]
     Client(String),
-
-    #[error("Codec error: {0}")]
-    Codec(Box<dyn std::error::Error + Send + Sync>),
 
     #[error("Message acknowledgment failed: {0}")]
     AckFailed(String),

@@ -5,7 +5,7 @@ use std::{
 };
 
 use futures::{
-    future::{try_join_all, BoxFuture},
+    future::{try_join_all, BoxFuture, Shared},
     FutureExt, Sink,
 };
 use google_cloud_googleapis::pubsub::v1::PubsubMessage;
@@ -20,7 +20,7 @@ type SinkFlushFuture = BoxFuture<'static, Result<(), PubSubError>>;
 /// Consumes messages and sends them to the pub/sub backend
 pub struct PubSubSink<M, Codec> {
     buffer: Vec<PubSubTask<PubSubCompact>>,
-    flush_future: Option<SinkFlushFuture>,
+    flush_future: Option<Shared<SinkFlushFuture>>,
     _marker: PhantomData<(M, Codec)>,
 }
 
@@ -128,7 +128,7 @@ where
                 Ok::<_, PubSubError>(())
             };
 
-            me.sink.flush_future = Some(fut.boxed());
+            me.sink.flush_future = Some(fut.boxed().shared());
         }
 
         if let Some(fut) = me.sink.flush_future.as_mut() {
