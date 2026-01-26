@@ -2,6 +2,9 @@
 name = "apalis-pubsub"
 version = "0.1.0"
 edition = "2021"
+description = "An implementation of Google's Pub/Sub backend for apalis"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ForesightMiningSoftwareCorporation/apalis-pubsub"
 
 [dependencies]
 apalis-core = { version = "1.0.0-rc.2", features = ["sleep"] }
